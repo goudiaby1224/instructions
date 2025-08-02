@@ -52,38 +52,58 @@ func NewPostgresDB(cfg Config) (*sql.DB, error) {
 }
 ```
 
-## Repository Pattern
+## Repository Pattern with Hexagonal Architecture
+
+### Port Definition
 
 ```go
-// internal/repository/interfaces.go
-package repository
-
-type UserRepository interface {
-    Create(ctx context.Context, user *User) error
-    GetByID(ctx context.Context, id string) (*User, error)
-    GetByEmail(ctx context.Context, email string) (*User, error)
-    Update(ctx context.Context, user *User) error
-    Delete(ctx context.Context, id string) error
-    List(ctx context.Context, filter ListFilter) ([]*User, error)
-}
-
-// internal/repository/user_postgres.go
-package repository
+// internal/core/ports/outgoing/user_repository.go
+package outgoing
 
 import (
-    "database/sql"
-    "fmt"
+    "context"
+    "myapi/internal/core/domain"
 )
 
-type postgresUserRepository struct {
+type UserRepository interface {
+    Save(ctx context.Context, user *domain.User) error
+    FindByID(ctx context.Context, id string) (*domain.User, error)
+    FindByEmail(ctx context.Context, email string) (*domain.User, error)
+    FindAll(ctx context.Context) ([]*domain.User, error)
+    Update(ctx context.Context, user *domain.User) error
+    Delete(ctx context.Context, id string) error
+}
+
+type ListFilter struct {
+    Limit  int
+    Offset int
+    Search string
+}
+```
+
+### PostgreSQL Adapter Implementation
+
+```go
+// internal/adapters/outgoing/database/postgres/user_repository.go
+package postgres
+
+import (
+    "context"
+    "database/sql"
+    "fmt"
+    "myapi/internal/core/domain"
+    "myapi/internal/core/ports/outgoing"
+)
+
+type userRepository struct {
     db *sql.DB
 }
 
-func NewPostgresUserRepository(db *sql.DB) UserRepository {
-    return &postgresUserRepository{db: db}
+func NewUserRepository(db *sql.DB) outgoing.UserRepository {
+    return &userRepository{db: db}
 }
 
-func (r *postgresUserRepository) Create(ctx context.Context, user *User) error {
+func (r *userRepository) Save(ctx context.Context, user *domain.User) error {
     query := `
         INSERT INTO users (id, email, name, password_hash, created_at, updated_at)
         VALUES ($1, $2, $3, $4, $5, $6)
@@ -100,22 +120,22 @@ func (r *postgresUserRepository) Create(ctx context.Context, user *User) error {
     
     if err != nil {
         if isUniqueViolation(err) {
-            return ErrDuplicateEmail
+            return domain.ErrEmailAlreadyExists
         }
-        return fmt.Errorf("failed to create user: %w", err)
+        return fmt.Errorf("failed to save user: %w", err)
     }
     
     return nil
 }
 
-func (r *postgresUserRepository) GetByID(ctx context.Context, id string) (*User, error) {
+func (r *userRepository) FindByID(ctx context.Context, id string) (*domain.User, error) {
     query := `
         SELECT id, email, name, password_hash, created_at, updated_at
         FROM users
         WHERE id = $1 AND deleted_at IS NULL
     `
     
-    var user User
+    var user domain.User
     err := r.db.QueryRowContext(ctx, query, id).Scan(
         &user.ID,
         &user.Email,
@@ -127,36 +147,35 @@ func (r *postgresUserRepository) GetByID(ctx context.Context, id string) (*User,
     
     if err != nil {
         if err == sql.ErrNoRows {
-            return nil, ErrNotFound
+            return nil, domain.ErrNotFound
         }
-        return nil, fmt.Errorf("failed to get user: %w", err)
+        return nil, fmt.Errorf("failed to find user: %w", err)
     }
     
     return &user, nil
 }
 
-func (r *postgresUserRepository) List(ctx context.Context, filter ListFilter) ([]*User, error) {
+func (r *userRepository) FindAll(ctx context.Context) ([]*domain.User, error) {
     query := `
-        SELECT id, email, name, created_at, updated_at
+        SELECT id, email, name, password_hash, created_at, updated_at
         FROM users
         WHERE deleted_at IS NULL
-        ORDER BY created_at DESC
-        LIMIT $1 OFFSET $2
     `
     
-    rows, err := r.db.QueryContext(ctx, query, filter.Limit, filter.Offset)
+    rows, err := r.db.QueryContext(ctx, query)
     if err != nil {
         return nil, fmt.Errorf("failed to list users: %w", err)
     }
     defer rows.Close()
     
-    var users []*User
+    var users []*domain.User
     for rows.Next() {
-        var user User
+        var user domain.User
         if err := rows.Scan(
             &user.ID,
             &user.Email,
             &user.Name,
+            &user.PasswordHash,
             &user.CreatedAt,
             &user.UpdatedAt,
         ); err != nil {
@@ -169,62 +188,128 @@ func (r *postgresUserRepository) List(ctx context.Context, filter ListFilter) ([
 }
 ```
 
-## Transaction Management
+### MongoDB Adapter Implementation
 
 ```go
-// internal/repository/transaction.go
-package repository
+// internal/adapters/outgoing/database/mongodb/user_repository.go
+package mongodb
 
-type TxRepository interface {
-    UserRepository
-    BeginTx(ctx context.Context) (TxRepository, error)
-    Commit() error
-    Rollback() error
+import (
+    "context"
+    "myapi/internal/core/domain"
+    "myapi/internal/core/ports/outgoing"
+    "go.mongodb.org/mongo-driver/bson"
+    "go.mongodb.org/mongo-driver/mongo"
+)
+
+type userRepository struct {
+    collection *mongo.Collection
 }
 
-type postgresTxRepository struct {
-    tx *sql.Tx
-    *postgresUserRepository
-}
-
-func (r *postgresUserRepository) BeginTx(ctx context.Context) (TxRepository, error) {
-    tx, err := r.db.BeginTx(ctx, nil)
-    if err != nil {
-        return nil, err
+func NewUserRepository(db *mongo.Database) outgoing.UserRepository {
+    return &userRepository{
+        collection: db.Collection("users"),
     }
-    
-    return &postgresTxRepository{
-        tx:                     tx,
-        postgresUserRepository: &postgresUserRepository{db: nil},
-    }, nil
 }
 
-// Transaction example in service
-func (s *UserService) CreateUserWithProfile(ctx context.Context, input *CreateUserInput) error {
-    tx, err := s.repo.BeginTx(ctx)
+func (r *userRepository) Save(ctx context.Context, user *domain.User) error {
+    doc := toDocument(user)
+    _, err := r.collection.InsertOne(ctx, doc)
+    if err != nil {
+        if mongo.IsDuplicateKeyError(err) {
+            return domain.ErrEmailAlreadyExists
+        }
+        return fmt.Errorf("failed to save user: %w", err)
+    }
+    return nil
+}
+
+func (r *userRepository) FindByID(ctx context.Context, id string) (*domain.User, error) {
+    var doc userDocument
+    err := r.collection.FindOne(ctx, bson.M{"_id": id}).Decode(&doc)
+    if err != nil {
+        if err == mongo.ErrNoDocuments {
+            return nil, domain.ErrNotFound
+        }
+        return nil, fmt.Errorf("failed to find user: %w", err)
+    }
+    return toDomainUser(doc), nil
+}
+
+// Document mapping
+type userDocument struct {
+    ID           string    `bson:"_id"`
+    Email        string    `bson:"email"`
+    Name         string    `bson:"name"`
+    PasswordHash string    `bson:"password_hash"`
+    CreatedAt    time.Time `bson:"created_at"`
+    UpdatedAt    time.Time `bson:"updated_at"`
+}
+
+func toDocument(user *domain.User) userDocument {
+    return userDocument{
+        ID:           user.ID,
+        Email:        user.Email,
+        Name:         user.Name,
+        PasswordHash: user.PasswordHash,
+        CreatedAt:    user.CreatedAt,
+        UpdatedAt:    user.UpdatedAt,
+    }
+}
+
+func toDomainUser(doc userDocument) *domain.User {
+    return &domain.User{
+        ID:           doc.ID,
+        Email:        doc.Email,
+        Name:         doc.Name,
+        PasswordHash: doc.PasswordHash,
+        CreatedAt:    doc.CreatedAt,
+        UpdatedAt:    doc.UpdatedAt,
+    }
+}
+```
+
+## Transaction Management with Ports
+
+```go
+// internal/core/ports/outgoing/transaction.go
+package outgoing
+
+import "context"
+
+type TransactionManager interface {
+    ExecuteInTx(ctx context.Context, fn func(ctx context.Context) error) error
+}
+
+// internal/adapters/outgoing/database/postgres/transaction.go
+package postgres
+
+type transactionManager struct {
+    db *sql.DB
+}
+
+func NewTransactionManager(db *sql.DB) outgoing.TransactionManager {
+    return &transactionManager{db: db}
+}
+
+func (tm *transactionManager) ExecuteInTx(ctx context.Context, fn func(ctx context.Context) error) error {
+    tx, err := tm.db.BeginTx(ctx, nil)
     if err != nil {
         return err
     }
-    defer tx.Rollback()
     
-    // Create user
-    user := &User{
-        ID:    uuid.New().String(),
-        Email: input.Email,
-        Name:  input.Name,
-    }
+    defer func() {
+        if p := recover(); p != nil {
+            tx.Rollback()
+            panic(p)
+        }
+    }()
     
-    if err := tx.Create(ctx, user); err != nil {
-        return err
-    }
+    // Store transaction in context
+    ctx = context.WithValue(ctx, "tx", tx)
     
-    // Create profile
-    profile := &Profile{
-        UserID: user.ID,
-        Bio:    input.Bio,
-    }
-    
-    if err := tx.CreateProfile(ctx, profile); err != nil {
+    if err := fn(ctx); err != nil {
+        tx.Rollback()
         return err
     }
     
@@ -434,3 +519,6 @@ func (qb *QueryBuilder) Build() (string, []interface{}) {
 8. **Use database migrations** for schema management
 9. **Monitor slow queries** and optimize
 10. **Implement retry logic** for transient errors
+11. **Keep adapters focused** on data translation
+12. **Map between domain models and database models**
+13. **Don't leak database details** into the core domain

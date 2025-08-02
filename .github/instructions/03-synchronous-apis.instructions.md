@@ -9,73 +9,221 @@
 - PATCH: Partial updates
 - DELETE: Remove resources
 
-## Handler Pattern
+## Hexagonal Architecture Handler Pattern
 
 ```go
-// internal/handlers/user.go
-package handlers
+// internal/adapters/incoming/http/user_handler.go
+package http
 
 import (
     "encoding/json"
     "net/http"
+    "myapi/internal/core/ports/incoming"
 )
 
 type UserHandler struct {
-    service UserService
+    userService incoming.UserService
 }
 
-func NewUserHandler(service UserService) *UserHandler {
-    return &UserHandler{service: service}
+func NewUserHandler(userService incoming.UserService) *UserHandler {
+    return &UserHandler{userService: userService}
 }
 
 // GET /api/v1/users
 func (h *UserHandler) List(w http.ResponseWriter, r *http.Request) {
-    users, err := h.service.GetAll(r.Context())
+    users, err := h.userService.GetAllUsers(r.Context())
     if err != nil {
         respondWithError(w, http.StatusInternalServerError, err.Error())
         return
     }
     
-    respondWithJSON(w, http.StatusOK, users)
-}
-
-// GET /api/v1/users/{id}
-func (h *UserHandler) Get(w http.ResponseWriter, r *http.Request) {
-    id := mux.Vars(r)["id"]
-    
-    user, err := h.service.GetByID(r.Context(), id)
-    if err != nil {
-        if errors.Is(err, ErrNotFound) {
-            respondWithError(w, http.StatusNotFound, "User not found")
-            return
-        }
-        respondWithError(w, http.StatusInternalServerError, err.Error())
-        return
+    // Convert domain models to DTOs
+    response := make([]UserDTO, len(users))
+    for i, user := range users {
+        response[i] = toUserDTO(user)
     }
     
-    respondWithJSON(w, http.StatusOK, user)
+    respondWithJSON(w, http.StatusOK, response)
 }
 
 // POST /api/v1/users
 func (h *UserHandler) Create(w http.ResponseWriter, r *http.Request) {
-    var input CreateUserRequest
-    if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+    var request CreateUserRequest
+    if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
         respondWithError(w, http.StatusBadRequest, "Invalid request body")
         return
     }
     
-    if err := input.Validate(); err != nil {
-        respondWithError(w, http.StatusBadRequest, err.Error())
-        return
-    }
+    // Convert DTO to domain model
+    user := toDomainUser(request)
     
-    user, err := h.service.Create(r.Context(), &input)
-    if err != nil {
+    if err := h.userService.CreateUser(r.Context(), user); err != nil {
         respondWithError(w, http.StatusInternalServerError, err.Error())
         return
     }
     
-    respondWithJSON(w, http.StatusCreated, user)
+    respondWithJSON(w, http.StatusCreated, toUserDTO(user))
+}
+
+// DTO definitions
+type UserDTO struct {
+    ID        string `json:"id"`
+    Email     string `json:"email"`
+    Name      string `json:"name"`
+    CreatedAt string `json:"created_at"`
+}
+
+type CreateUserRequest struct {
+    Email    string `json:"email" validate:"required,email"`
+    Name     string `json:"name" validate:"required,min=2,max=100"`
+    Password string `json:"password" validate:"required,min=8"`
+}
+
+// Conversion functions
+func toUserDTO(user *domain.User) UserDTO {
+    return UserDTO{
+        ID:        user.ID,
+        Email:     user.Email,
+        Name:      user.Name,
+        CreatedAt: user.CreatedAt.Format(time.RFC3339),
+    }
+}
+
+func toDomainUser(req CreateUserRequest) *domain.User {
+    return &domain.User{
+        Email: req.Email,
+        Name:  req.Name,
+    }
+}
+```
+
+## Port Definitions
+
+```go
+// internal/core/ports/incoming/user_service.go
+package incoming
+
+import (
+    "context"
+    "myapi/internal/core/domain"
+)
+
+type UserService interface {
+    CreateUser(ctx context.Context, user *domain.User) error
+    GetUser(ctx context.Context, id string) (*domain.User, error)
+    GetAllUsers(ctx context.Context) ([]*domain.User, error)
+    UpdateUser(ctx context.Context, user *domain.User) error
+    DeleteUser(ctx context.Context, id string) error
+}
+```
+
+## Service Implementation
+
+```go
+// internal/core/services/user_service.go
+package services
+
+import (
+    "context"
+    "myapi/internal/core/domain"
+    "myapi/internal/core/ports/incoming"
+    "myapi/internal/core/ports/outgoing"
+)
+
+type userService struct {
+    userRepo outgoing.UserRepository
+    logger   outgoing.Logger
+}
+
+func NewUserService(
+    userRepo outgoing.UserRepository,
+    logger outgoing.Logger,
+) incoming.UserService {
+    return &userService{
+        userRepo: userRepo,
+        logger:   logger,
+    }
+}
+
+func (s *userService) CreateUser(ctx context.Context, user *domain.User) error {
+    // Business logic validation
+    if err := user.Validate(); err != nil {
+        return err
+    }
+    
+    // Check if email exists
+    existing, err := s.userRepo.FindByEmail(ctx, user.Email)
+    if err != nil && !errors.Is(err, domain.ErrNotFound) {
+        return err
+    }
+    if existing != nil {
+        return domain.ErrEmailAlreadyExists
+    }
+    
+    // Generate ID and timestamps
+    user.ID = uuid.New().String()
+    user.CreatedAt = time.Now()
+    user.UpdatedAt = time.Now()
+    
+    // Hash password
+    if err := user.HashPassword(); err != nil {
+        return err
+    }
+    
+    // Save to repository
+    if err := s.userRepo.Save(ctx, user); err != nil {
+        s.logger.Error("failed to save user", "error", err)
+        return err
+    }
+    
+    return nil
+}
+
+func (s *userService) GetAllUsers(ctx context.Context) ([]*domain.User, error) {
+    return s.userRepo.FindAll(ctx)
+}
+```
+
+## Domain Model
+
+```go
+// internal/core/domain/user.go
+package domain
+
+import (
+    "errors"
+    "golang.org/x/crypto/bcrypt"
+    "time"
+)
+
+type User struct {
+    ID           string
+    Email        string
+    Name         string
+    PasswordHash string
+    CreatedAt    time.Time
+    UpdatedAt    time.Time
+}
+
+func (u *User) Validate() error {
+    if u.Email == "" {
+        return errors.New("email is required")
+    }
+    if u.Name == "" {
+        return errors.New("name is required")
+    }
+    // Add more validation rules
+    return nil
+}
+
+func (u *User) HashPassword() error {
+    // Business logic for password hashing
+    hash, err := bcrypt.GenerateFromPassword([]byte(u.PasswordHash), bcrypt.DefaultCost)
+    if err != nil {
+        return err
+    }
+    u.PasswordHash = string(hash)
+    return nil
 }
 ```
 
@@ -184,3 +332,5 @@ func (s *UserService) Create(ctx context.Context, input *CreateUserRequest) (*Us
 6. **Handle errors consistently**
 7. **Use dependency injection**
 8. **Implement idempotency for POST/PUT**
+9. **Keep adapters thin** - Business logic belongs in the core
+10. **Use DTOs** - Don't expose domain models directly
