@@ -55,12 +55,32 @@ myapi/
 │   │       └── order_service.go
 │   └── adapters/            # External adapters
 │       ├── incoming/        # Driving adapters (API, CLI, etc.)
-│       │   ├── http/        # HTTP REST handlers
+│       │   ├── http/        # Synchronous HTTP REST handlers
 │       │   │   ├── server.go
 │       │   │   ├── user_handler.go
 │       │   │   └── order_handler.go
-│       │   ├── grpc/        # gRPC handlers
+│       │   ├── grpc/        # Synchronous gRPC handlers
 │       │   │   └── server.go
+│       │   ├── messaging/   # Asynchronous message handlers
+│       │   │   ├── kafka/
+│       │   │   │   ├── consumer.go
+│       │   │   │   ├── user_events_handler.go
+│       │   │   │   └── order_events_handler.go
+│       │   │   ├── rabbitmq/
+│       │   │   │   ├── consumer.go
+│       │   │   │   └── event_handler.go
+│       │   │   ├── nats/
+│       │   │   │   ├── subscriber.go
+│       │   │   │   └── event_handler.go
+│       │   │   └── redis/
+│       │   │       ├── subscriber.go
+│       │   │       └── pub_sub_handler.go
+│       │   ├── websocket/   # Real-time WebSocket handlers
+│       │   │   ├── hub.go
+│       │   │   └── client.go
+│       │   ├── cron/        # Scheduled job handlers
+│       │   │   ├── scheduler.go
+│       │   │   └── job_handlers.go
 │       │   └── cli/         # CLI commands
 │       │       └── commands.go
 │       └── outgoing/        # Driven adapters (DB, external services)
@@ -73,6 +93,13 @@ myapi/
 │           ├── cache/       # Cache implementations
 │           │   └── redis/
 │           │       └── cache_service.go
+│           ├── messaging/   # Message publishing
+│           │   ├── kafka/
+│           │   │   └── producer.go
+│           │   ├── rabbitmq/
+│           │   │   └── publisher.go
+│           │   └── nats/
+│           │       └── publisher.go
 │           └── external/    # External service clients
 │               ├── payment/
 │               │   └── stripe_client.go
@@ -140,13 +167,157 @@ myapi/
 
 ##### `/internal/adapters/incoming`
 - Driving adapters that trigger use cases
-- Examples: HTTP handlers, gRPC services, CLI commands
-- Depends on input ports
+- **Synchronous adapters**: HTTP handlers, gRPC services, CLI commands
+- **Asynchronous adapters**: Kafka consumers, RabbitMQ consumers, NATS subscribers
+- **Real-time adapters**: WebSocket handlers, Server-Sent Events
+- **Scheduled adapters**: Cron jobs, scheduled tasks
+- All depend on input ports
+
+###### `/internal/adapters/incoming/messaging`
+- Asynchronous message consumers and event handlers
+- Each messaging system has its own subdirectory
+- Handles message deserialization and routing to appropriate services
+- Implements error handling, retries, and dead letter queues
+
+###### `/internal/adapters/incoming/websocket`
+- Real-time communication handlers
+- Manages WebSocket connections and broadcasts
+- Handles connection lifecycle and message routing
+
+###### `/internal/adapters/incoming/cron`
+- Scheduled job handlers
+- Background task processing
+- Periodic maintenance operations
 
 ##### `/internal/adapters/outgoing`
 - Driven adapters that are called by the core
-- Examples: Database repositories, cache services, external APIs
+- Examples: Database repositories, cache services, external APIs, message publishers
 - Implements output ports
+
+## Asynchronous Incoming Adapter Examples
+
+### Kafka Consumer Example
+```go
+// internal/adapters/incoming/messaging/kafka/user_events_handler.go
+package kafka
+
+import (
+    "context"
+    "encoding/json"
+    "myapi/internal/core/ports/incoming"
+)
+
+type UserEventsHandler struct {
+    userService incoming.UserService
+    logger      Logger
+}
+
+func (h *UserEventsHandler) HandleUserCreated(ctx context.Context, message []byte) error {
+    var event UserCreatedEvent
+    if err := json.Unmarshal(message, &event); err != nil {
+        return fmt.Errorf("failed to unmarshal user created event: %w", err)
+    }
+    
+    // Convert event to domain model and call service
+    user := event.ToDomainUser()
+    return h.userService.ProcessUserCreated(ctx, user)
+}
+
+func (h *UserEventsHandler) HandleUserUpdated(ctx context.Context, message []byte) error {
+    var event UserUpdatedEvent
+    if err := json.Unmarshal(message, &event); err != nil {
+        return fmt.Errorf("failed to unmarshal user updated event: %w", err)
+    }
+    
+    user := event.ToDomainUser()
+    return h.userService.ProcessUserUpdated(ctx, user)
+}
+```
+
+### Message Consumer Setup
+```go
+// internal/adapters/incoming/messaging/kafka/consumer.go
+package kafka
+
+type Consumer struct {
+    reader       *kafka.Reader
+    handlers     map[string]MessageHandler
+    logger       Logger
+    errorHandler ErrorHandler
+}
+
+func (c *Consumer) Subscribe(topic string, handler MessageHandler) {
+    c.handlers[topic] = handler
+}
+
+func (c *Consumer) Start(ctx context.Context) error {
+    for {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        default:
+            message, err := c.reader.ReadMessage(ctx)
+            if err != nil {
+                c.logger.Error("failed to read message", "error", err)
+                continue
+            }
+            
+            handler, exists := c.handlers[message.Topic]
+            if !exists {
+                c.logger.Warn("no handler for topic", "topic", message.Topic)
+                continue
+            }
+            
+            if err := handler.Handle(ctx, message.Value); err != nil {
+                c.errorHandler.Handle(ctx, message, err)
+            }
+        }
+    }
+}
+```
+
+### Dependency Injection for Async Adapters
+```go
+// cmd/api/main.go
+func main() {
+    // Initialize outgoing adapters
+    userRepo := postgres.NewUserRepository(db)
+    
+    // Initialize services
+    userService := services.NewUserService(userRepo)
+    
+    // Initialize synchronous incoming adapters
+    httpServer := http.NewServer(userService)
+    
+    // Initialize asynchronous incoming adapters
+    kafkaConsumer := kafka.NewConsumer(kafkaConfig)
+    userEventsHandler := kafka.NewUserEventsHandler(userService, logger)
+    
+    // Subscribe to topics
+    kafkaConsumer.Subscribe("user.created", userEventsHandler.HandleUserCreated)
+    kafkaConsumer.Subscribe("user.updated", userEventsHandler.HandleUserUpdated)
+    
+    // Start all adapters
+    go httpServer.Start()
+    go kafkaConsumer.Start(context.Background())
+    
+    // Graceful shutdown
+    // ...
+}
+```
+
+## Best Practices for Async Incoming Adapters
+
+1. **Separate message handling from business logic**
+2. **Use dependency injection for services**
+3. **Implement proper error handling and retry mechanisms**
+4. **Use structured logging with correlation IDs**
+5. **Handle message deserialization errors gracefully**
+6. **Implement idempotency for message processing**
+7. **Use circuit breakers for external dependencies**
+8. **Monitor message processing metrics**
+9. **Implement dead letter queues for failed messages**
+10. **Use context for cancellation and timeouts**
 
 ## Best Practices
 
